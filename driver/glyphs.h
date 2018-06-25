@@ -5,38 +5,6 @@ typedef unsigned char	u_int8;
 typedef unsigned short	u_int16;
 typedef unsigned long	u_int32;
 
-enum {
-	DISPLAY_UNKNOWN,
-	DISPLAY_COMMON_CATHODE_FD628,
-	DISPLAY_COMMON_ANODE_FD628,
-	DISPLAY_COMMON_CATHODE_5D_FD620,
-	DISPLAY_COMMON_CATHODE_4D_FD620,
-	DISPLAY_COMMON_CATHODE_5D_TM1618,
-	DISPLAY_COMMON_CATHODE_4D_TM1618,
-	DISPLAY_TYPE_MAX
-};
-
-enum {
-	LED_DOT_ALARM_APPS,
-	LED_DOT_USB_SETUP,
-	LED_DOT_PLAY_USB,
-	LED_DOT_PAUSE_CARD,
-	LED_DOT_SEC,
-	LED_DOT_ETH_HDMI,
-	LED_DOT_WIFI_CVBS,
-	LED_DOT_MAX
-};
-
-static const u_int8 ledDots[LED_DOT_MAX] = {
-	0x01,
-	0x02,
-	0x04,
-	0x08,
-	0x10,
-	0x20,
-	0x40
-};
-
 /** Character conversion of digital tube display code*/
 typedef struct _led_bitmap {
 	u_int8 character;
@@ -108,8 +76,7 @@ static const led_bitmap LED_decode_tab1[] = {
 	{'x', b1|c1|e1|f1|g1      },	{'X', b1|c1|e1|f1|g1      },
 	{'y', a1|c1|e1|f1|g1      },	{'Y', a1|c1|e1|f1|g1      },
 	{'z', a1|b1|d1|e1|g1      },	{'Z', a1|b1|d1|e1|g1      },
-	{'_', a1}, {'-', g1},
-
+	{'_', a1}, {'-', g1}, {' ', 0}, { 0xB0, c1|d1|e1|g1 }
 };
 
 #define a2 0x08
@@ -172,8 +139,7 @@ static const led_bitmap LED_decode_tab2[] = {
 	{'x', b2|c2|e2|f2|g2      },	{'X', b2|c2|e2|f2|g2      },
 	{'y', a2|c2|e2|f2|g2      },	{'Y', a2|c2|e2|f2|g2      },
 	{'z', a2|b2|d2|e2|g2      },	{'Z', a2|b2|d2|e2|g2      },
-	{'_', a2}, {'-', g2},
-
+	{'_', a2}, {'-', g2}, {' ', 0}, { 0xB0, c2|d2|e2|g2 }
 };
 
 #endif
