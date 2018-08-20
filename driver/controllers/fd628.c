@@ -1,5 +1,5 @@
 #include "../protocols/i2c.h"
-#include "../protocols/spi_3w.h"
+#include "../protocols/spi.h"
 #include "fd628.h"
 
 /* ****************************** Define FD628 Commands ****************************** */
@@ -54,7 +54,6 @@ extern const led_bitmap *ledCodes;
 struct controller_interface *init_fd628(struct vfd_dev *_dev)
 {
 	dev = _dev;
-	fd628_init();
 	return &fd628_interface;
 }
 
@@ -71,12 +70,19 @@ static size_t fd628_write_data_real(unsigned char address, const unsigned char *
 
 static unsigned char fd628_init(void)
 {
+	unsigned char slow_freq = dev->dtb_active.display.flags & DISPLAY_FLAG_LOW_FREQ;
 	protocol = dev->dtb_active.display.controller == CONTROLLER_HBS658 ?
-		init_i2c(0, I2C_LSB_FIRST, dev->clk_pin, dev->dat_pin, I2C_DELAY_100KHz) :
-		init_spi_3w(dev->clk_pin, dev->dat_pin, dev->stb_pin, SPI_DELAY_100KHz);
+		init_i2c(0, I2C_LSB_FIRST, dev->clk_pin, dev->dat_pin, slow_freq ? I2C_DELAY_20KHz : I2C_DELAY_100KHz) :
+		init_spi_3w(dev->clk_pin, dev->dat_pin, dev->stb_pin, slow_freq ? SPI_DELAY_20KHz : SPI_DELAY_100KHz);
+	if (!protocol)
+		return 0;
+
 	switch(dev->dtb_active.display.type) {
 		case DISPLAY_TYPE_5D_7S_T95:
 			ledCodes = LED_decode_tab1;
+			break;
+		case DISPLAY_TYPE_5D_7S_G9SX:
+			ledCodes = LED_decode_tab3;
 			break;
 		default:
 			ledCodes = LED_decode_tab2;
@@ -184,6 +190,7 @@ static void fd628_set_icon(const char *name, unsigned char state)
 	switch (dtb->display.type) {
 	case DISPLAY_TYPE_5D_7S_NORMAL:
 	case DISPLAY_TYPE_5D_7S_T95:
+	case DISPLAY_TYPE_5D_7S_G9SX:
 	default:
 		if (strncmp(name,"alarm",5) == 0) {
 			dev->status_led_mask = state ? (dev->status_led_mask | dtb->led_dots[LED_DOT1_ALARM]) : (dev->status_led_mask & ~dtb->led_dots[LED_DOT1_ALARM]);
@@ -279,6 +286,7 @@ static size_t fd628_write_data(const unsigned char *_data, size_t length)
 	case DISPLAY_TYPE_5D_7S_ABOX:
 	case DISPLAY_TYPE_4D_7S_COL:
 	case DISPLAY_TYPE_5D_7S_M9_PRO:
+	case DISPLAY_TYPE_5D_7S_G9SX:
 	default:
 		for (i = 0; i < length; i++)
 			dev->wbuf[dtb->dat_index[i]] = data[i];

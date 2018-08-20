@@ -18,43 +18,31 @@
  * along with this program; if not, write to the Free Software
  */
 
+#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
-#include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/errno.h>
 #include <linux/leds.h>
 #include <linux/string.h>
-
 #include <linux/ioctl.h>
 #include <linux/device.h>
-
-#include <linux/errno.h>
-#include <linux/mutex.h>
-
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
-
-#include <linux/fcntl.h>
 #include <linux/poll.h>
-
-#include <linux/sched.h>
-
 #include <linux/gpio.h>
-#include <linux/amlogic/aml_gpio_consumer.h>
 #include <linux/of_gpio.h>
-#include <linux/amlogic/iomap.h>
-
 #include "openvfd_drv.h"
-
 #include "controllers/controller_list.h"
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
 #include <linux/earlysuspend.h>
 static struct early_suspend openvfd_early_suspend;
 #endif
+
+unsigned char vfd_display_auto_power = 1;
 
 static struct vfd_platform_data *pdata = NULL;
 struct kp {
@@ -64,6 +52,7 @@ struct kp {
 static struct kp *kp;
 
 static struct controller_interface *controller = NULL;
+static struct mutex mutex;
 
 /****************************************************************
  *	Function Name:		FD628_GetKey
@@ -80,7 +69,9 @@ static u_int32 FD628_GetKey(struct vfd_dev *dev)
 {
 	u_int8 i, keyDataBytes[5];
 	u_int32 FD628_KeyData = 0;
+	mutex_lock(&dev->mutex);
 	controller->read_data(keyDataBytes, sizeof(keyDataBytes));
+	mutex_unlock(&dev->mutex);
 	for (i = 0; i != 5; i++) {			/* Pack 5 bytes of key code values into 2 words */
 		if (keyDataBytes[i] & 0x01)
 			FD628_KeyData |= (0x00000001 << i * 2);
@@ -93,6 +84,22 @@ static u_int32 FD628_GetKey(struct vfd_dev *dev)
 	}
 
 	return (FD628_KeyData);
+}
+
+static void unlocked_set_power(unsigned char state)
+{
+	if (vfd_display_auto_power && controller) {
+		controller->set_power(state);
+		if (state && pdata)
+			controller->set_brightness_level(pdata->dev->brightness);
+	}
+}
+
+static void set_power(unsigned char state)
+{
+	mutex_lock(&mutex);
+	unlocked_set_power(state);
+	mutex_unlock(&mutex);
 }
 
 static void init_controller(struct vfd_dev *dev)
@@ -111,6 +118,14 @@ static void init_controller(struct vfd_dev *dev)
 		pr_dbg2("Select FD650 controller\n");
 		temp_ctlr = init_fd650(dev);
 		break;
+	case CONTROLLER_PCD8544:
+		pr_dbg2("Select PCD8544 controller\n");
+		temp_ctlr = init_pcd8544(dev);
+		break;
+	case CONTROLLER_SH1106:
+		pr_dbg2("Select SH1106 controller\n");
+		temp_ctlr = init_ssd1306(dev);
+		break;
 	case CONTROLLER_SSD1306:
 		pr_dbg2("Select SSD1306 controller\n");
 		temp_ctlr = init_ssd1306(dev);
@@ -125,9 +140,15 @@ static void init_controller(struct vfd_dev *dev)
 		break;
 	}
 
-	if (controller && controller != temp_ctlr)
-		controller->set_power(0);
-	controller = temp_ctlr;
+	if (controller != temp_ctlr) {
+		unlocked_set_power(0);
+		controller = temp_ctlr;
+		if (!controller->init()) {
+			pr_dbg2("Failed to initialize the controller, reverting to Dummy controller\n");
+			controller = init_dummy(dev);
+			dev->dtb_active.display.controller = CONTROLLER_7S_MAX;
+		}
+	}
 }
 
 static int openvfd_dev_open(struct inode *inode, struct file *file)
@@ -136,14 +157,14 @@ static int openvfd_dev_open(struct inode *inode, struct file *file)
 	file->private_data = pdata->dev;
 	dev = file->private_data;
 	memset(dev->wbuf, 0x00, sizeof(dev->wbuf));
-	controller->set_brightness_level(pdata->dev->brightness);
+	set_power(1);
 	pr_dbg("openvfd_dev_open now.............................\r\n");
 	return 0;
 }
 
 static int openvfd_dev_release(struct inode *inode, struct file *file)
 {
-	controller->set_power(0);
+	set_power(0);
 	file->private_data = NULL;
 	pr_dbg("succes to close  openvfd_dev.............\n");
 	return 0;
@@ -193,12 +214,14 @@ static ssize_t openvfd_dev_write(struct file *filp, const char __user * buf,
 	if (count == sizeof(data)) {
 		missing = copy_from_user(&data, buf, count);
 		if (missing == 0 && count > 0) {
+			mutex_lock(&mutex);
 			if (controller->write_display_data(&data))
 				pr_dbg("openvfd_dev_write count : %ld\n", count);
 			else {
 				status = -1;
 				pr_error("openvfd_dev_write failed to write %ld bytes (display_data)\n", count);
 			}
+			mutex_unlock(&mutex);
 		}
 	} else if (count > 0) {
 		unsigned char *raw_data;
@@ -206,12 +229,14 @@ static ssize_t openvfd_dev_write(struct file *filp, const char __user * buf,
 		raw_data = kzalloc(count, GFP_KERNEL);
 		if (raw_data) {
 			missing = copy_from_user(raw_data, buf, count);
+			mutex_lock(&mutex);
 			if (controller->write_data((unsigned char*)raw_data, count))
 				pr_dbg("openvfd_dev_write count : %ld\n", count);
 			else {
 				status = -1;
 				pr_error("openvfd_dev_write failed to write %ld bytes (raw_data)\n", count);
 			}
+			mutex_unlock(&mutex);
 			kfree(raw_data);
 		}
 		else {
@@ -254,6 +279,7 @@ static long openvfd_dev_ioctl(struct file *filp, unsigned int cmd,
 	if (err)
 		return -EFAULT;
 
+	mutex_lock(&mutex);
 	switch (cmd) {
 	case VFD_IOC_USE_DTB_CONFIG:
 		dev->dtb_active = dev->dtb_default;
@@ -302,9 +328,11 @@ static long openvfd_dev_ioctl(struct file *filp, unsigned int cmd,
 		ret = __get_user(dev->status_led_mask, (int __user *)arg);
 		break;
 	default:		/* redundant, as cmd was checked against MAXNR */
-		return -ENOTTY;
+		ret = -ENOTTY;
+		break;
 	}
 
+	mutex_unlock(&mutex);
 	return ret;
 }
 
@@ -348,12 +376,16 @@ static int register_openvfd_driver(void)
 
 static void deregister_openvfd_driver(void)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
 	int ret = 0;
 	ret = misc_deregister(&openvfd_device);
 	if (ret)
 		pr_dbg("%s: failed to deregister openvfd module\n", __func__);
 	else
 		pr_dbg("%s: Succeeded to deregister openvfd module \n", __func__);
+#else
+	misc_deregister(&openvfd_device);
+#endif
 }
 
 
@@ -411,6 +443,7 @@ static ssize_t led_cmd_store(struct device *_dev,
 
 	buf += sizeof(int);
 	memcpy(&temp, buf, sizeof(int));
+	mutex_lock(&mutex);
 	switch (cmd) {
 		case VFD_IOC_SMODE:
 			dev->mode = (u_int8)temp;
@@ -447,6 +480,7 @@ static ssize_t led_cmd_store(struct device *_dev,
 			break;
 	}
 
+	mutex_unlock(&mutex);
 	return size;
 }
 
@@ -476,31 +510,37 @@ static ssize_t led_off_store(struct device *dev,
 	return size;
 }
 
-static DEVICE_ATTR(led_cmd , 0666, led_cmd_show , led_cmd_store);
-static DEVICE_ATTR(led_on , 0666, led_on_show , led_on_store);
-static DEVICE_ATTR(led_off , 0666, led_off_show , led_off_store);
+static DEVICE_ATTR(led_cmd , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, led_cmd_show , led_cmd_store);
+static DEVICE_ATTR(led_on , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, led_on_show , led_on_store);
+static DEVICE_ATTR(led_off , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, led_off_show , led_off_store);
 
+#ifdef CONFIG_HAS_EARLYSUSPEND
 static void openvfd_suspend(struct early_suspend *h)
 {
 	pr_info("%s!\n", __func__);
-	controller->set_power(0);
+	set_power(0);
 }
 
 static void openvfd_resume(struct early_suspend *h)
 {
 	pr_info("%s!\n", __func__);
-	controller->set_brightness_level(pdata->dev->brightness);
+	set_power(1);
 }
+#endif
 
 unsigned char vfd_gpio_clk[3];
 unsigned char vfd_gpio_dat[3];
 unsigned char vfd_gpio_stb[3];
+unsigned char vfd_gpio0[3] = { 0x00, 0x00, 0xFF };
+unsigned char vfd_gpio1[3] = { 0x00, 0x00, 0xFF };
 unsigned char vfd_chars[7] = { 0, 1, 2, 3, 4, 5, 6 };
 unsigned char vfd_dot_bits[8] = { 0, 1, 2, 3, 4, 5, 6, 0 };
 unsigned char vfd_display_type[4] = { 0x00, 0x00, 0x00, 0x00 };
 int vfd_gpio_clk_argc = 0;
 int vfd_gpio_dat_argc = 0;
 int vfd_gpio_stb_argc = 0;
+int vfd_gpio0_argc = 3;
+int vfd_gpio1_argc = 3;
 int vfd_chars_argc = 0;
 int vfd_dot_bits_argc = 0;
 int vfd_display_type_argc = 0;
@@ -508,9 +548,12 @@ int vfd_display_type_argc = 0;
 module_param_array(vfd_gpio_clk, byte, &vfd_gpio_clk_argc, 0000);
 module_param_array(vfd_gpio_dat, byte, &vfd_gpio_dat_argc, 0000);
 module_param_array(vfd_gpio_stb, byte, &vfd_gpio_stb_argc, 0000);
+module_param_array(vfd_gpio0, byte, &vfd_gpio0_argc, 0000);
+module_param_array(vfd_gpio1, byte, &vfd_gpio1_argc, 0000);
 module_param_array(vfd_chars, byte, &vfd_chars_argc, 0000);
 module_param_array(vfd_dot_bits, byte, &vfd_dot_bits_argc, 0000);
 module_param_array(vfd_display_type, byte, &vfd_display_type_argc, 0000);
+module_param(vfd_display_auto_power, byte, 0000);
 
 static void print_param_debug(const char *label, int argc, unsigned char param[])
 {
@@ -538,7 +581,11 @@ static int get_chip_pin_number(const unsigned char gpio[])
 	int pin = -1;
 	if (gpio[0] < 6) {
 		struct gpio_chip *chip;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
 		const char *pin_banks[] = { "banks", "ao-bank", "gpio0", "gpio1", "gpio2", "gpio3" };
+#else
+		const char *pin_banks[] = { "periphs-banks", "aobus-banks", "gpio0-banks", "gpio1-banks", "gpio2-banks", "gpio3-banks" };
+#endif
 		const char *bank_name = pin_banks[gpio[0]];
 
 		chip = gpiochip_find((char *)bank_name, is_right_chip);
@@ -554,6 +601,34 @@ static int get_chip_pin_number(const unsigned char gpio[])
 	return pin;
 }
 
+int evaluate_pin(const char *name, const unsigned char *vfd_arg, struct vfd_pin *pin, unsigned char enable_skip_evaluation)
+{
+	int ret = 0;
+	if (enable_skip_evaluation && vfd_arg[2] == 0xFF) {
+		pin->pin = -2;
+		pr_dbg2("Skipping %s evaluation (0xFF)\n", name);
+	}
+	else if ((ret = pin->pin = get_chip_pin_number(vfd_arg)) >= 0)
+		pin->flags.value = (unsigned int)vfd_arg[2];
+	else
+		pr_error("Could not get pin number for %s\n", name);
+	return ret;
+}
+
+char gpio_chip_names[1024] = { 0 };
+
+static int enum_gpio_chips(struct gpio_chip *chip, void *data)
+{
+	static unsigned char first_iteration = 1;
+	const char *sep = ", ";
+	size_t str_len = strlen(gpio_chip_names);
+	if (first_iteration)
+		sep = "";
+	scnprintf(gpio_chip_names + str_len, sizeof(gpio_chip_names) - str_len, "%s%s", sep, chip->label);
+	first_iteration = 0;
+	return 0;
+}
+
 static int verify_module_params(struct vfd_dev *dev)
 {
 	int ret = (vfd_gpio_clk_argc == 3 && vfd_gpio_dat_argc == 3 && vfd_gpio_stb_argc == 3 &&
@@ -562,24 +637,24 @@ static int verify_module_params(struct vfd_dev *dev)
 	print_param_debug("vfd_gpio_clk:\t\t", vfd_gpio_clk_argc, vfd_gpio_clk);
 	print_param_debug("vfd_gpio_dat:\t\t", vfd_gpio_dat_argc, vfd_gpio_dat);
 	print_param_debug("vfd_gpio_stb:\t\t", vfd_gpio_stb_argc, vfd_gpio_stb);
+	print_param_debug("vfd_gpio0:\t\t", vfd_gpio0_argc, vfd_gpio0);
+	print_param_debug("vfd_gpio1:\t\t", vfd_gpio1_argc, vfd_gpio1);
 	print_param_debug("vfd_chars:\t\t", vfd_chars_argc, vfd_chars);
 	print_param_debug("vfd_dot_bits:\t\t", vfd_dot_bits_argc, vfd_dot_bits);
 	print_param_debug("vfd_display_type:\t", vfd_display_type_argc, vfd_display_type);
 
+	gpiochip_find(NULL, enum_gpio_chips);
+	pr_dbg2("Detected gpio chips:\t%s.\n", gpio_chip_names);
 	if (ret >= 0)
-		if ((ret = dev->clk_pin = get_chip_pin_number(vfd_gpio_clk)) < 0)
-			pr_error("Could not get pin number for vfd_gpio_clk\n");
+		ret = evaluate_pin("vfd_gpio_clk", vfd_gpio_clk, &dev->clk_pin, 0);
 	if (ret >= 0)
-		if ((ret = dev->dat_pin = get_chip_pin_number(vfd_gpio_dat)) < 0)
-			pr_error("Could not get pin number for vfd_gpio_dat\n");
-	if (ret >= 0) {
-		if (vfd_gpio_stb[2] == 0xFF) {
-			dev->stb_pin = -2;
-			pr_dbg2("Skipping vfd_gpio_stb evaluation (0xFF)\n");
-		}
-		else if ((ret = dev->stb_pin = get_chip_pin_number(vfd_gpio_stb)) < 0)
-			pr_error("Could not get pin number for vfd_gpio_stb\n");
-	}
+		ret = evaluate_pin("vfd_gpio_dat", vfd_gpio_dat, &dev->dat_pin, 0);
+	if (ret >= 0)
+		ret = evaluate_pin("vfd_gpio_stb", vfd_gpio_stb, &dev->stb_pin, 1);
+	if (ret >= 0)
+		ret = evaluate_pin("vfd_gpio0", vfd_gpio0, &dev->gpio0_pin, 1);
+	if (ret >= 0)
+		ret = evaluate_pin("vfd_gpio1", vfd_gpio1, &dev->gpio1_pin, 1);
 
 	if (ret >= 0) {
 		int i;
@@ -596,12 +671,36 @@ static int verify_module_params(struct vfd_dev *dev)
 	return ret >= 0;
 }
 
+void get_pin_from_dt(const char *name, const struct platform_device *pdev, struct vfd_pin *pin)
+{
+	if (of_find_property(pdev->dev.of_node, name, NULL)) {
+		pin->pin = of_get_named_gpio_flags(pdev->dev.of_node, name, 0, &pin->flags.value);
+		pr_dbg2("%s: pin = %d, flags = 0x%02X\n", name, pin->pin, pin->flags.value);
+	} else {
+		pin->pin = -2;
+		pr_dbg2("%s pin entry not found\n", name);
+	}
+}
+
+int request_pin(const char *name, struct vfd_pin *pin, unsigned char enable_skip)
+{
+	int ret = 0;
+	pin->flags.bits.is_requested = 0;
+	if (!enable_skip || pin->pin != -2) {
+		ret = -1;
+		if (pin->pin >= 0)
+			ret = gpio_request(pin->pin, DEV_NAME);
+		if (!ret)
+			pin->flags.bits.is_requested = 1;
+		else
+			pr_error("can't request gpio of %s", name);
+	}
+	return ret;
+}
+
 static int openvfd_driver_probe(struct platform_device *pdev)
 {
 	int state = -EINVAL;
-	struct gpio_desc *clk_desc = NULL;
-	struct gpio_desc *dat_desc = NULL;
-	struct gpio_desc *stb_desc = NULL;
 	struct property *chars_prop = NULL;
 	struct property *dot_bits_prop = NULL;
 	struct property *display_type_prop = NULL;
@@ -628,35 +727,18 @@ static int openvfd_driver_probe(struct platform_device *pdev)
 		pr_error("platform dev is required!\n");
 		goto get_param_mem_fail;
 	}
+	memset(pdata->dev, 0, sizeof(*(pdata->dev)));
 
+	pdata->dev->mutex = &mutex;
 	if (!verify_module_params(pdata->dev)) {
+		int i;
+		__u8 j;
 		pr_error("Failed to verify VFD configuration file, attempt using device tree as fallback.\n");
-		if (of_find_property(pdev->dev.of_node, MOD_NAME_CLK, NULL)) {
-			clk_desc = of_get_named_gpiod_flags(pdev->dev.of_node, MOD_NAME_CLK, 0, NULL);
-			pdata->dev->clk_pin = desc_to_gpio(clk_desc);
-			pr_dbg2("fd628_gpio_clk pin = %d\n", pdata->dev->clk_pin);
-		} else {
-			pdata->dev->clk_pin = -1;
-			pr_dbg2("fd628_gpio_clk pin entry not found\n");
-		}
-
-		if (of_find_property(pdev->dev.of_node, MOD_NAME_DAT, NULL)) {
-			dat_desc = of_get_named_gpiod_flags(pdev->dev.of_node, MOD_NAME_DAT, 0, NULL);
-			pdata->dev->dat_pin = desc_to_gpio(dat_desc);
-			pr_dbg2("fd628_gpio_dat pin = %d\n", pdata->dev->dat_pin);
-		} else {
-			pdata->dev->dat_pin = -1;
-			pr_dbg2("fd628_gpio_dat pin entry not found\n");
-		}
-
-		if (of_find_property(pdev->dev.of_node, MOD_NAME_STB, NULL)) {
-			stb_desc = of_get_named_gpiod_flags(pdev->dev.of_node, MOD_NAME_STB, 0, NULL);
-			pdata->dev->stb_pin = desc_to_gpio(stb_desc);
-			pr_dbg2("fd628_gpio_stb pin = %d\n", pdata->dev->stb_pin);
-		} else {
-			pdata->dev->stb_pin = -1;
-			pr_dbg2("fd628_gpio_stb pin entry not found\n");
-		}
+		get_pin_from_dt(MOD_NAME_CLK, pdev, &pdata->dev->clk_pin);
+		get_pin_from_dt(MOD_NAME_DAT, pdev, &pdata->dev->dat_pin);
+		get_pin_from_dt(MOD_NAME_STB, pdev, &pdata->dev->stb_pin);
+		get_pin_from_dt(MOD_NAME_GPIO0, pdev, &pdata->dev->gpio0_pin);
+		get_pin_from_dt(MOD_NAME_GPIO1, pdev, &pdata->dev->gpio1_pin);
 
 		chars_prop = of_find_property(pdev->dev.of_node, MOD_NAME_CHARS, NULL);
 		if (!chars_prop || !chars_prop->value) {
@@ -668,14 +750,14 @@ static int openvfd_driver_probe(struct platform_device *pdev)
 			chars_prop = NULL;
 		}
 
-		for (__u8 i = 0; i < (sizeof(pdata->dev->dtb_active.dat_index) / sizeof(char)); i++)
-			pdata->dev->dtb_active.dat_index[i] = i;
+		for (j = 0; j < (sizeof(pdata->dev->dtb_active.dat_index) / sizeof(char)); j++)
+			pdata->dev->dtb_active.dat_index[j] = j;
 		pr_dbg2("chars_prop = %p\n", chars_prop);
 		if (chars_prop) {
 			__u8 *c = (__u8*)chars_prop->value;
 			const int length = min(chars_prop->length, (int)(sizeof(pdata->dev->dtb_active.dat_index) / sizeof(char)));
 			pr_dbg2("chars_prop->length = %d\n", chars_prop->length);
-			for (int i = 0; i < length; i++) {
+			for (i = 0; i < length; i++) {
 				pdata->dev->dtb_active.dat_index[i] = c[i];
 				pr_dbg2("char #%d: %d\n", i, c[i]);
 			}
@@ -691,13 +773,13 @@ static int openvfd_driver_probe(struct platform_device *pdev)
 			dot_bits_prop = NULL;
 		}
 
-		for (int i = 0; i < LED_DOT_MAX; i++)
+		for (i = 0; i < LED_DOT_MAX; i++)
 			pdata->dev->dtb_active.led_dots[i] = ledDots[i];
 		pr_dbg2("dot_bits_prop = %p\n", dot_bits_prop);
 		if (dot_bits_prop) {
 			__u8 *d = (__u8*)dot_bits_prop->value;
 			pr_dbg2("dot_bits_prop->length = %d\n", dot_bits_prop->length);
-			for (int i = 0; i < dot_bits_prop->length; i++) {
+			for (i = 0; i < dot_bits_prop->length; i++) {
 				pdata->dev->dtb_active.led_dots[i] = ledDots[d[i]];
 				pr_dbg2("dot_bit #%d: %d\n", i, d[i]);
 			}
@@ -711,39 +793,26 @@ static int openvfd_driver_probe(struct platform_device *pdev)
 			pdata->dev->dtb_active.display.type, pdata->dev->dtb_active.display.controller, pdata->dev->dtb_active.display.flags);
 	}
 
-	ret = -1;
-	if (pdata->dev->clk_pin >= 0)
-		ret = gpio_request(pdata->dev->clk_pin, DEV_NAME);
-	if (ret) {
-		pr_error("can't request gpio of gpio_clk");
-		goto get_param_mem_fail;
-	}
-
-	ret = -1;
-	if (pdata->dev->dat_pin >= 0)
-		ret = gpio_request(pdata->dev->dat_pin, DEV_NAME);
-	if (ret) {
-		pr_error("can't request gpio of gpio_dat");
-		goto get_gpio_req_fail_dat;
-	}
-
-	if (pdata->dev->stb_pin != -2) {
-		ret = -1;
-		if (pdata->dev->stb_pin >= 0)
-			ret = gpio_request(pdata->dev->stb_pin, DEV_NAME);
-		if (ret) {
-			pr_error("can't request gpio of gpio_stb");
-			goto get_gpio_req_fail_stb;
-		}
-	}
+	if (request_pin("gpio_clk", &pdata->dev->clk_pin, 0))
+		goto get_gpio_req_fail;
+	if (request_pin("dat_pin", &pdata->dev->dat_pin, 0))
+		goto get_gpio_req_fail;
+	if (request_pin("stb_pin", &pdata->dev->stb_pin, 1))
+		goto get_gpio_req_fail;
+	if (request_pin("gpio0_pin", &pdata->dev->gpio0_pin, 1))
+		goto get_gpio_req_fail;
+	if (request_pin("gpio1_pin", &pdata->dev->gpio1_pin, 1))
+		goto get_gpio_req_fail;
 
 	pdata->dev->dtb_default = pdata->dev->dtb_active;
 	pdata->dev->brightness = 0xFF;
 
+	mutex_lock(&mutex);
 	register_openvfd_driver();
 	kp = kzalloc(sizeof(struct kp) ,  GFP_KERNEL);
 	if (!kp) {
 		kfree(kp);
+		mutex_unlock(&mutex);
 		return -ENOMEM;
 	}
 	kp->cdev.name = DEV_NAME;
@@ -751,6 +820,7 @@ static int openvfd_driver_probe(struct platform_device *pdev)
 	ret = led_classdev_register(&pdev->dev, &kp->cdev);
 	if (ret < 0) {
 		kfree(kp);
+		mutex_unlock(&mutex);
 		return ret;
 	}
 
@@ -784,33 +854,49 @@ static int openvfd_driver_probe(struct platform_device *pdev)
 	register_early_suspend(&openvfd_early_suspend);
 #endif
 
+	mutex_unlock(&mutex);
 	return 0;
 
-	  get_gpio_req_fail_stb:
-	gpio_free(pdata->dev->dat_pin);
-	  get_gpio_req_fail_dat:
-	gpio_free(pdata->dev->clk_pin);
+	  get_gpio_req_fail:
+	if (pdata->dev->gpio1_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->gpio1_pin.pin);
+	if (pdata->dev->gpio0_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->gpio0_pin.pin);
+	if (pdata->dev->stb_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->stb_pin.pin);
+	if (pdata->dev->dat_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->dat_pin.pin);
+	if (pdata->dev->clk_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->clk_pin.pin);
 	  get_param_mem_fail:
 	kfree(pdata->dev);
 	  get_openvfd_mem_fail:
 	kfree(pdata);
 	  get_openvfd_node_fail:
+	if (pdata && pdata->dev)
+		mutex_unlock(&mutex);
 	return state;
 }
 
 static int openvfd_driver_remove(struct platform_device *pdev)
 {
-	controller->set_power(0);
+	set_power(0);
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	unregister_early_suspend(&openvfd_early_suspend);
 #endif
 	led_classdev_unregister(&kp->cdev);
 	deregister_openvfd_driver();
 #ifdef CONFIG_OF
-	gpio_free(pdata->dev->clk_pin);
-	gpio_free(pdata->dev->dat_pin);
-	if (pdata->dev->stb_pin >= 0)
-		gpio_free(pdata->dev->stb_pin);
+	if (pdata->dev->gpio1_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->gpio1_pin.pin);
+	if (pdata->dev->gpio0_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->gpio0_pin.pin);
+	if (pdata->dev->stb_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->stb_pin.pin);
+	if (pdata->dev->dat_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->dat_pin.pin);
+	if (pdata->dev->clk_pin.flags.bits.is_requested)
+		gpio_free(pdata->dev->clk_pin.pin);
 	kfree(pdata->dev);
 	kfree(pdata);
 	pdata = NULL;
@@ -821,21 +907,20 @@ static int openvfd_driver_remove(struct platform_device *pdev)
 static void openvfd_driver_shutdown(struct platform_device *dev)
 {
 	pr_dbg("openvfd_driver_shutdown");
-	controller->set_power(0);
+	set_power(0);
 }
 
 static int openvfd_driver_suspend(struct platform_device *dev, pm_message_t state)
 {
 	pr_dbg("openvfd_driver_suspend");
-	controller->set_power(0);
+	set_power(0);
 	return 0;
 }
 
 static int openvfd_driver_resume(struct platform_device *dev)
 {
 	pr_dbg("openvfd_driver_resume");
-	controller->set_brightness_level(pdata->dev->brightness);
-
+	set_power(1);
 	return 0;
 }
 
@@ -864,12 +949,14 @@ static struct platform_driver openvfd_driver = {
 static int __init openvfd_driver_init(void)
 {
 	pr_dbg("OpenVFD Driver init.\n");
+	mutex_init(&mutex);
 	return platform_driver_register(&openvfd_driver);
 }
 
 static void __exit openvfd_driver_exit(void)
 {
 	pr_dbg("OpenVFD Driver exit.\n");
+	mutex_destroy(&mutex);
 	platform_driver_unregister(&openvfd_driver);
 }
 

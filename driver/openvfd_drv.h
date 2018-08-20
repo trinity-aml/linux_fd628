@@ -3,13 +3,8 @@
 
 #ifdef MODULE
 #include <linux/delay.h>
-#include <asm/io.h>
 #include <linux/slab.h>
-#include <asm/uaccess.h>
-#include <linux/of.h>
-#include <linux/amlogic/aml_gpio_consumer.h>
-#include <linux/switch.h>
-#include <linux/time.h>
+#include <linux/mutex.h>
 #endif
 #include "glyphs.h"
 
@@ -59,12 +54,14 @@
 
 #ifdef MODULE
 
-#define MOD_NAME_CLK       "fd628_gpio_clk"
-#define MOD_NAME_DAT       "fd628_gpio_dat"
-#define MOD_NAME_STB       "fd628_gpio_stb"
-#define MOD_NAME_CHARS     "fd628_chars"
-#define MOD_NAME_DOTS      "fd628_dot_bits"
-#define MOD_NAME_TYPE      "fd628_display_type"
+#define MOD_NAME_CLK       "openvfd_gpio_clk"
+#define MOD_NAME_DAT       "openvfd_gpio_dat"
+#define MOD_NAME_STB       "openvfd_gpio_stb"
+#define MOD_NAME_GPIO0     "openvfd_gpio0"
+#define MOD_NAME_GPIO1     "openvfd_gpio1"
+#define MOD_NAME_CHARS     "openvfd_chars"
+#define MOD_NAME_DOTS      "openvfd_dot_bits"
+#define MOD_NAME_TYPE      "openvfd_display_type"
 
 #endif
 
@@ -85,17 +82,40 @@ struct vfd_dtb_config {
 	struct vfd_display display;
 };
 
+struct vfd_pin {
+	int pin;
+	union {
+		struct {
+			u_int8 active_low	: 1;
+			u_int8 single_ended	: 1;
+			u_int8 open_drain	: 1;
+			u_int8 sleep_keep	: 1;
+			u_int8 pullup_on	: 1;
+			u_int8 pulldown_on	: 1;
+			u_int8 kick_high	: 1;
+			u_int8 kick_low		: 1;
+			u_int8 reserved2;
+			u_int8 reserved3;
+			u_int8 reserved4	: 7;
+			u_int8 is_requested	: 1;
+		} bits;
+		unsigned int value;
+	} flags;
+};
+
 struct vfd_dev {
-	int clk_pin;
-	int dat_pin;
-	int stb_pin;
+	struct vfd_pin clk_pin;
+	struct vfd_pin dat_pin;
+	struct vfd_pin stb_pin;
+	struct vfd_pin gpio0_pin;
+	struct vfd_pin gpio1_pin;
 	u_int16 wbuf[7];
 	struct vfd_dtb_config dtb_active;
 	struct vfd_dtb_config dtb_default;
 	u_int8 mode;
 	u_int8 power;
 	u_int8 brightness;
-	struct semaphore sem;
+	struct mutex *mutex;
 	wait_queue_head_t kb_waitq;	/* read and write queues */
 	struct timer_list timer;
 	int key_respond_status;
@@ -159,7 +179,9 @@ enum {
 	CONTROLLER_FD650,
 	CONTROLLER_HBS658,
 	CONTROLLER_7S_MAX,
-	CONTROLLER_SSD1306	= 0xFD,
+	CONTROLLER_PCD8544	= 0xFB,
+	CONTROLLER_SH1106,
+	CONTROLLER_SSD1306,
 	CONTROLLER_HD44780,
 };
 
@@ -171,11 +193,14 @@ enum {
 	DISPLAY_TYPE_FD620_REF,
 	DISPLAY_TYPE_4D_7S_COL,
 	DISPLAY_TYPE_5D_7S_M9_PRO,
+	DISPLAY_TYPE_5D_7S_G9SX,
 	DISPLAY_TYPE_MAX,
 };
 
-#define DISPLAY_FLAG_TRANSPOSED		0x01
+#define DISPLAY_FLAG_TRANSPOSED	0x01
 #define DISPLAY_FLAG_TRANSPOSED_INT	0x00010000
+#define DISPLAY_FLAG_LOW_FREQ		0x40
+#define DISPLAY_FLAG_LOW_FREQ_INT	0x00400000
 
 enum {
 	LED_DOT1_ALARM,

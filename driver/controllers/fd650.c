@@ -1,5 +1,4 @@
 #include "../protocols/i2c.h"
-#include "../protocols/spi_3w.h"
 #include "fd650.h"
 
 /* ****************************** Define FD650 Commands ****************************** */
@@ -52,7 +51,6 @@ extern const led_bitmap *ledCodes;
 struct controller_interface *init_fd650(struct vfd_dev *_dev)
 {
 	dev = _dev;
-	fd650_init();
 	return &fd650_interface;
 }
 
@@ -70,7 +68,11 @@ static size_t fd650_write_data_real(unsigned char address, const unsigned char *
 
 static unsigned char fd650_init(void)
 {
-	protocol = init_i2c(0, I2C_MSB_FIRST, dev->clk_pin, dev->dat_pin, I2C_DELAY_100KHz);
+	unsigned char slow_freq = dev->dtb_active.display.flags & DISPLAY_FLAG_LOW_FREQ;
+	protocol = init_i2c(0, I2C_MSB_FIRST, dev->clk_pin, dev->dat_pin, slow_freq ? I2C_DELAY_20KHz : I2C_DELAY_100KHz);
+	if (!protocol)
+		return 0;
+
 	memset(dev->wbuf, 0x00, sizeof(dev->wbuf));
 	fd650_set_brightness_level(dev->brightness);
 	switch(dev->dtb_active.display.type) {

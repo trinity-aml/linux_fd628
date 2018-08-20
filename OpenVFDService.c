@@ -1,29 +1,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <string.h>
-#include <sys/select.h>
 #include <time.h>
 #include <sys/ioctl.h>
 #include <pthread.h>
-#include <semaphore.h>
-#include <sys/ipc.h>
-#include <dirent.h>
 #include <stdint.h>
 #include <signal.h>
-
-#include <time.h>
 #include "driver/openvfd_drv.h"
 
 #define UNUSED(x)	(void*)(x)
 #define DRV_NAME	"/dev/" DEV_NAME
 #define PIPE_PATH	"/tmp/" DEV_NAME "_service"
 
+void select_display_type(void);
 bool set_display_type(int new_display_type);
 bool is_verbose(int argc, char *argv[]);
 bool is_demo_mode(int argc, char *argv[]);
@@ -95,7 +86,7 @@ struct sync_data sync_data;
 void led_display_loop(bool demo_mode)
 {
 	static struct vfd_display_data data;
-	int ret = -1, i;
+	int ret = -1;
 
 	time_t now;
 	struct tm *timenow;
@@ -130,8 +121,8 @@ void led_display_loop(bool demo_mode)
 					if (demo_mode) {
 						data.mode = 1 + timenow->tm_sec / 12;
 						data.temperature = timenow->tm_hour + timenow->tm_min + timenow->tm_sec;
-						data.channel_data.channel = 10*(timenow->tm_hour + timenow->tm_min + timenow->tm_sec);
-						data.channel_data.channel_count = 86400;
+						data.channel_data.channel = (u_int16)10*(timenow->tm_hour + timenow->tm_min + timenow->tm_sec);
+						data.channel_data.channel_count = (u_int16)86400;
 						data.time_date.hours = ((timenow->tm_sec >= 24) && (timenow->tm_sec < 30)) ? 0 : (timenow->tm_hour == 0) ? 24 : timenow->tm_hour;
 						data.time_date.minutes = timenow->tm_min;
 						data.time_date.seconds = timenow->tm_sec;
@@ -171,7 +162,6 @@ void led_display_loop(bool demo_mode)
 void led_test_codes()
 {
 	unsigned short write_buffer[7];
-	int ret = -1;
 	unsigned char val = ':';
 	unsigned int i = 0;
 
@@ -184,7 +174,7 @@ void led_test_codes()
 		write_buffer[4] = char_to_mask(ledCodes[i].character);
 		write_buffer[0] = val;
 
-		ret = write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
+		write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
 		mdelay(500);
 	}
 
@@ -197,7 +187,7 @@ void led_test_codes()
 		write_buffer[4] = char_to_mask(4);
 		write_buffer[0] = val;
 
-		ret = write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
+		write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
 		mdelay(500);
 	}
 
@@ -211,7 +201,7 @@ void led_test_codes()
 		write_buffer[4] = char_to_mask(8);
 		write_buffer[0] &= dotLeds[i%LED_DOT_MAX].bitmap;
 
-		ret = write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
+		write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
 		mdelay(500);
 	}
 
@@ -225,7 +215,7 @@ void led_test_codes()
 		write_buffer[4] = char_to_mask(9);
 		write_buffer[0] |= dotLeds[i%LED_DOT_MAX].bitmap;
 
-		ret = write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
+		write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
 		mdelay(500);
 	}
 }
@@ -246,7 +236,8 @@ void led_test_loop(bool cycle_display_types)
 
 		if (cycle_display_types) {
 			printf("Process ID = %d\n", pid);
-			current_type = (++current_type) % DISPLAY_TYPE_MAX;
+			++current_type;
+			current_type %= DISPLAY_TYPE_MAX;
 			if (!current_type)
 				transposed = (~transposed & DISPLAY_FLAG_TRANSPOSED_INT);
 			printf("Set display type to 0x%08X\n", current_type | transposed);
@@ -304,7 +295,7 @@ void *display_test_thread_handler(void *arg)
 
 void *named_pipe_thread_handler(void *arg)
 {
-	FILE *file;
+	int file;
 	char buf[1024];
 	int ret = 0, i;
 	unsigned char skipSignal;
@@ -319,7 +310,7 @@ void *named_pipe_thread_handler(void *arg)
 		file = open(PIPE_PATH, O_RDONLY);
 		ret = read(file, buf, sizeof(buf));
 		close(file);
-		buf[ret] = NULL;
+		buf[ret] = '\0';
 		if (verbose) {
 			printf("ret = %d, %s\n", ret, buf);
 			for (i = 0; i < ret; i++)
@@ -377,6 +368,9 @@ void select_display_type()
 			case DISPLAY_TYPE_5D_7S_T95:
 				ledCodes = LED_decode_tab1;
 				break;
+			case DISPLAY_TYPE_5D_7S_G9SX:
+				ledCodes = LED_decode_tab3;
+				break;
 			default:
 				ledCodes = LED_decode_tab2;
 				break;
@@ -401,7 +395,7 @@ bool set_display_type(int new_display_type)
 
 void handle_signal(int signal)
 {
-	FILE *file;
+	int file;
 	sync_data.isActive = false;
 	file = open(PIPE_PATH, O_WRONLY);
 	write(file, "\1", 1);
@@ -500,10 +494,12 @@ int get_cmd_display_type(int argc, char *argv[])
 				char *start, *end;
 				start = !strncmp(argv[i+1], "0x", 2) ? argv[i+1] + 2 : argv[i+1];
 				temp = strtol(start, &end, 0x10);
-				if (end == start || *end != '\0' || errno == ERANGE)
+				if (end == start || *end != '\0' || errno == ERANGE) {
 					printf("Error parsing display type index.\n");
-				else
+				} else {
 					ret = (int)temp;
+					printf("Display type 0x%08X\n", ret);
+				}
 			} else {
 				printf("Error parsing display type index, missing argument.\n");
 			}
